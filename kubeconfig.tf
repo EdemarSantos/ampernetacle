@@ -1,17 +1,15 @@
-resource "null_resource" "wait_for_kube_apiserver" {
-  depends_on = [oci_core_instance._[1]]
-  provisioner "local-exec" {
-    command = <<-EOT
-      while ! curl -k https://${oci_core_instance._[1].public_ip}:6443; do
-        sleep 1
-      done
-    EOT
-  }
+locals {
+  is_windows = substr(pathexpand("~"), 0, 1) == "/" ? false : true
 }
 
 data "external" "kubeconfig" {
-  depends_on = [null_resource.wait_for_kube_apiserver]
-  program = [
+  depends_on = [oci_core_instance._[1]]
+  program = local.is_windows ? [
+    "powershell",
+    <<EOT
+    write-host "{`"base64`": `"$(ssh -o StrictHostKeyChecking=no -l k8s -i ${local_file.ssh_private_key.filename} ${oci_core_instance._[1].public_ip} sudo base64 -w0 /etc/kubernetes/admin.conf)`"}"
+    EOT
+    ] : [
     "sh",
     "-c",
     <<-EOT
@@ -21,7 +19,7 @@ data "external" "kubeconfig" {
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -l k8s -i ${local_file.ssh_private_key.filename} \
               ${oci_core_instance._[1].public_ip} \
-              sudo cat /etc/kubernetes/admin.conf | base64 -w0
+              'sudo cat /etc/kubernetes/admin.conf | base64 -w0'
             )'"}'
     EOT
   ]

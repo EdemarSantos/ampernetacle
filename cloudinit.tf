@@ -3,10 +3,13 @@ locals {
     "apt-transport-https",
     "build-essential",
     "ca-certificates",
+    "containerd.io",
     "curl",
-    "docker.io",
+    "docker-ce",
+    "gpg",
     "jq",
     "kubeadm",
+    "kubectl",
     "kubelet",
     "lsb-release",
     "make",
@@ -34,9 +37,13 @@ data "cloudinit_config" "_" {
       apt:
         sources:
           kubernetes.list:
-            source: "deb https://apt.kubernetes.io/ kubernetes-xenial main"
+            source: "deb https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /"
             key: |
-              ${indent(8, data.http.apt_repo_key.body)}
+              ${indent(8, data.http.kubernetes_repo_key.response_body)}
+          docker.list:
+            source: "deb https://download.docker.com/linux/ubuntu jammy stable"
+            key: |
+              ${indent(8, data.http.docker_repo_key.response_body)}
       users:
       - default
       - name: k8s
@@ -57,7 +64,7 @@ data "cloudinit_config" "_" {
         permissions: "0600"
         content: |
           kind: InitConfiguration
-          apiVersion: kubeadm.k8s.io/v1beta2
+          apiVersion: kubeadm.k8s.io/v1beta3
           bootstrapTokens:
           - token: ${local.kubeadm_token}
           ---
@@ -66,7 +73,7 @@ data "cloudinit_config" "_" {
           cgroupDriver: cgroupfs
           ---
           kind: ClusterConfiguration
-          apiVersion: kubeadm.k8s.io/v1beta2
+          apiVersion: kubeadm.k8s.io/v1beta3
           apiServer:
             certSANs:
             - @@PUBLIC_IP_ADDRESS@@
@@ -88,19 +95,38 @@ data "cloudinit_config" "_" {
   # By default, all inbound traffic is blocked
   # (except SSH) so we need to change that.
   part {
-    filename     = "allow-inbound-traffic.sh"
+    filename     = "1-allow-inbound-traffic.sh"
     content_type = "text/x-shellscript"
     content      = <<-EOF
       #!/bin/sh
       sed -i "s/-A INPUT -j REJECT --reject-with icmp-host-prohibited//" /etc/iptables/rules.v4 
+      sed -i "s/-A FORWARD -j REJECT --reject-with icmp-host-prohibited//" /etc/iptables/rules.v4
+      # There appears to be a bug in the netfilter-persistent scripts:
+      # the "reload" and "restart" actions seem to append the rules files
+      # to the existing rules (instead of replacing them), perhaps because
+      # the "stop" action is disabled. So instead, we need to flush the
+      # rules first before we load the new rule set.
+      netfilter-persistent flush
       netfilter-persistent start
+    EOF
+  }
+
+  # Docker's default containerd configuration disables CRI.
+  # Let's re-enable it.
+  part {
+    filename     = "2-re-enable-cri.sh"
+    content_type = "text/x-shellscript"
+    content      = <<-EOF
+      #!/bin/sh
+      echo "# Use containerd's default configuration instead of the one shipping with Docker." > /etc/containerd/config.toml
+      systemctl restart containerd
     EOF
   }
 
   dynamic "part" {
     for_each = each.value.role == "controlplane" ? ["yes"] : []
     content {
-      filename     = "kubeadm-init.sh"
+      filename     = "3-kubeadm-init.sh"
       content_type = "text/x-shellscript"
       content      = <<-EOF
         #!/bin/sh
@@ -108,8 +134,7 @@ data "cloudinit_config" "_" {
         sed -i s/@@PUBLIC_IP_ADDRESS@@/$PUBLIC_IP_ADDRESS/ /etc/kubeadm_config.yaml
         kubeadm init --config=/etc/kubeadm_config.yaml --ignore-preflight-errors=NumCPU
         export KUBECONFIG=/etc/kubernetes/admin.conf
-        kubever=$(kubectl version | base64 | tr -d '\n')
-        kubectl apply -f https://cloud.weave.works/k8s/net?k8s-version=$kubever
+        kubectl apply -f https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s-1.11.yaml
         mkdir -p /home/k8s/.kube
         cp $KUBECONFIG /home/k8s/.kube/config
         chown -R k8s:k8s /home/k8s/.kube
@@ -120,18 +145,30 @@ data "cloudinit_config" "_" {
   dynamic "part" {
     for_each = each.value.role == "worker" ? ["yes"] : []
     content {
-      filename     = "kubeadm-join.sh"
+      filename     = "3-kubeadm-join.sh"
       content_type = "text/x-shellscript"
       content      = <<-EOF
       #!/bin/sh
-      kubeadm join --discovery-token-unsafe-skip-ca-verification --token ${local.kubeadm_token} ${local.nodes[1].ip_address}:6443
+      KUBE_API_SERVER=${local.nodes[1].ip_address}:6443
+      while ! curl --insecure https://$KUBE_API_SERVER; do
+        echo "Kubernetes API server ($KUBE_API_SERVER) not responding."
+        echo "Waiting 10 seconds before we try again."
+        sleep 10
+      done
+      echo "Kubernetes API server ($KUBE_API_SERVER) appears to be up."
+      echo "Trying to join this node to the cluster."
+      kubeadm join --discovery-token-unsafe-skip-ca-verification --token ${local.kubeadm_token} $KUBE_API_SERVER
     EOF
     }
   }
 }
 
-data "http" "apt_repo_key" {
-  url = "https://packages.cloud.google.com/apt/doc/apt-key.gpg.asc"
+data "http" "kubernetes_repo_key" {
+  url = "https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key"
+}
+
+data "http" "docker_repo_key" {
+  url = "https://download.docker.com/linux/debian/gpg"
 }
 
 # The kubeadm token must follow a specific format:
@@ -141,7 +178,7 @@ data "http" "apt_repo_key" {
 
 resource "random_string" "token1" {
   length  = 6
-  number  = true
+  numeric = true
   lower   = true
   special = false
   upper   = false
@@ -149,7 +186,7 @@ resource "random_string" "token1" {
 
 resource "random_string" "token2" {
   length  = 16
-  number  = true
+  numeric = true
   lower   = true
   special = false
   upper   = false
